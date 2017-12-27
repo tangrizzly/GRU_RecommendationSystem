@@ -22,13 +22,11 @@ class Config(object):
         self.epochs = 30 if os.path.isfile('./user_buys.txt') else 50
         self.latent_size = 20
         self.alpha = 0.1
-        self.lmd = 0.001
+        # self.lmd = 0.001
         self.mini_batch = 0  # 0:one_by_one,   1:mini_batch
         self.mvgru = 0  # 0:gru, 1:mv-gru, 2:mv-gru-2units, 3:mv-gru-con, 4:mv-gru-fusion
         self.batch_size_train = 4  # size大了之后性能下降非常严重。one_by_one训练时该参数无效。
         self.batch_size_test = 768  # user*item矩阵太大，要多次计算。a5下亲测768最快。
-        if self.mini_batch == 0:
-            self.batch_size = 1
-        else:
-            self.batch_size = self.batch_size_train if 1 == v else self.batch_size_test
+        self.batch_size = self.batch_size_train if 1 == v else self.batch_size_test
         self.keep_prob = 1.0
+        self.layers = 1

@@ -39,6 +39,8 @@ def load_taobao_data(config):
 
     x_train = []
     x_test = []
+    x_train_length = []
+    x_test_length = []
     # Max_item_no = 0
 
     for i in np.arange(len(buys)):
@@ -48,15 +50,17 @@ def load_taobao_data(config):
         if len(idx) != 0 and len(xi_train) != 0:
             # print(i)
             x_train.append(xi_train)
+            x_train_length.append(len(xi_train))
             # Max_item_no = np.max([Max_item_no, np.max(xi_train), np.max(xi_test)])
             xi_test_dd = [xi_test[index] for index in sorted(idx)]
             x_test.append(xi_test_dd)
+            x_test_length.append(len(xi_test))
 
     x_train_pd = pd.DataFrame(data=x_train)
     x_test_pd = pd.DataFrame(data=x_test)
     Max_item_no = np.nanmax([x_train_pd.iloc[:, 1].values, x_test_pd.iloc[:, 1].values])
 
-    return x_train_pd, x_test_pd, Max_item_no
+    return x_train_pd, x_test_pd, x_train_length, x_test_length, Max_item_no
 
 
 
