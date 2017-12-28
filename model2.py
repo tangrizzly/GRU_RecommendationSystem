@@ -6,124 +6,159 @@ Created on 26/12/2017 10:16 AM
 @author: Tangrizzly
 """
 import tensorflow as tf
-
 from utils import *
 
 
 class taobao(object):
-    def __init__(self, config, session, max_item_no):  # , x_train, x_test, x_train_length, x_test_length, Max_item_no):
+    def __init__(self, config, session, max_item_no, whole_items, train_set, test_set, train_length, test_length):
         self.sess = session
         self.config = config
-        self.mode = config.mode
+        # self.mode = config.mode
         self.at_nums = config.at_nums
         self.latent_size = config.latent_size
         self.embedding_size = self.latent_size
-        self.lr = config.alpha
-        self.mini_batch = config.mini_batch
-        self.batch_size = config.batch_size
+        self.alpha = config.alpha
+        self.lmd = config.lmd
+        self.batch_size_train = config.batch_size_train
+        self.batch_size_test = config.batch_size_test
         self.epochs = config.epochs
-        self.items_size = max_item_no+1
+        self.items_size = max_item_no + 1
         self.keep_prob = config.keep_prob
-        self.hidden_act = self.tanh
-        self.final_activation = self.tanh
-        self.loss_function = self.bpr
-        self.layers = config.layers
-
-        self.build()
-        self.sess.run(tf.global_variables_initializer())
-        self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=10)
-
-    def bpr(self, yhat):
-        yhatT = tf.transpose(yhat)
-        return tf.reduce_mean(-tf.log(tf.nn.sigmoid(tf.diag_part(yhat) - yhatT)))
-
-    def tanh(self, X):
-        return tf.nn.tanh(X)
+        self.whole_items = whole_items
+        self.ckpt_path = config.ckpt_path
+        self.train_set = train_set
+        self.test_set = test_set
+        self.train_length = train_length
+        self.test_length = test_length
+        self.save_per_epoch = config.save_per_epoch
 
     def build(self):
-        self.X = tf.placeholder(tf.int32, [self.batch_size], name='input')
-        self.Y = tf.placeholder(tf.int32, [self.batch_size], name='output')
-        self.state = [tf.placeholder(tf.float32, [self.batch_size, self.latent_size], name='rnn_state') for _ in
-                      range(self.layers)]
-        self.final_state = self.state
+        tf.set_random_seed(1)
+        self.item_input = tf.placeholder(tf.int32, [None, None], name='input')
+        self.item_output = tf.placeholder(tf.int32, [None, None], name='output')
+        self.item_neg_output = tf.placeholder(tf.int32, [None, None], name='negtive_output')
+        sigma = np.sqrt(6.0 / (self.items_size + self.latent_size))
+        initializer = tf.random_uniform_initializer(minval=-sigma, maxval=sigma)
+        self.embedding = tf.get_variable('embedding', [self.items_size, self.latent_size], initializer=initializer)
+        self.item_input_embedded = tf.nn.embedding_lookup(self.embedding, self.item_input)
         self.global_step = tf.Variable(0, name='global_step', trainable=False)
+        self.loss = None
+        self.rec10 = None
+        self.max_10 = None
 
         with tf.variable_scope('gru_layer'):
-            sigma = np.sqrt(6.0 / (self.items_size + self.latent_size))
-            initializer = tf.random_uniform_initializer(minval=-sigma, maxval=sigma)
-            embedding = tf.get_variable('embedding', [self.items_size, self.latent_size], initializer=initializer)
-            softmax_W = tf.get_variable('softmax_w', [self.items_size, self.latent_size], initializer=initializer)
-            softmax_b = tf.get_variable('softmax_b', [self.items_size], initializer=tf.constant_initializer(0.0))
+            cell = tf.contrib.rnn.GRUCell(self.latent_size, activation=tf.tanh)
+            self.cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=self.keep_prob)
+            self.output, self.state = tf.nn.dynamic_rnn(cell=self.cell, inputs=self.item_input_embedded,
+                                                        dtype=tf.float32)
 
-            cell = tf.contrib.rnn.GRUCell(self.latent_size, activation=self.hidden_act)
-            drop_cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=self.keep_prob)
-            stacked_cell = tf.contrib.rnn.MultiRNNCell([drop_cell] * self.layers)
+        with tf.variable_scope('output'):
+            cal_scores = tf.map_fn(lambda x: tf.matmul(x, self.embedding, transpose_b=True), self.output)
+            func = lambda x: tf.reduce_sum(
+                tf.cast(tf.nn.in_top_k(x, tf.reshape(self.item_output, [-1]), 10), tf.float32))
+            self.rec10 = tf.map_fn(func, cal_scores)
 
-            inputs = tf.nn.embedding_lookup(embedding, self.X)
-            output, state = stacked_cell(inputs, tuple(self.state))
-            self.final_state = state
+            self.item_output_embedded = tf.nn.embedding_lookup(self.embedding, self.item_output)
+            self.y_p = tf.multiply(self.output, self.item_output_embedded)  # positive example
+            self.item_neg_output_embedded = tf.nn.embedding_lookup(self.embedding, self.item_neg_output)
+            self.y_n = tf.multiply(self.output, self.item_neg_output_embedded)  # positive example  # negative example
+            tvars = tf.trainable_variables()
+            lossL2 = tf.add_n([tf.nn.l2_loss(v) for v in tvars
+                               if 'bias' not in v.name]) * self.lmd
+            loss = tf.reduce_sum(-tf.log(tf.sigmoid(self.y_p - self.y_n)))
+            self.loss = loss + lossL2
 
-        if self.mode == 'valid':
-            # Use other examples of the minibatch as negative samples.
-            sampled_W = tf.nn.embedding_lookup(softmax_W, self.Y)
-            sampled_b = tf.nn.embedding_lookup(softmax_b, self.Y)
-            logits = tf.matmul(output, sampled_W, transpose_b=True) + sampled_b
-            self.yhat = self.final_activation(logits)
-            self.cost = self.loss_function(self.yhat)
+        self.train_op = tf.train.AdamOptimizer(learning_rate=self.alpha).minimize(self.loss,
+                                                                                  global_step=self.global_step)
+        self.saver = tf.train.Saver()
+
+    def train(self, mode=None, restore=False):
+        if mode != "continue":
+            print("Building the model...")
+            self.build()
+            self.sess.run(tf.global_variables_initializer())
         else:
-            logits = tf.matmul(output, softmax_W, transpose_b=True) + softmax_b
-            self.yhat = self.final_activation(logits)
+            if restore:
+                self.saver.restore(sess=self.sess, save_path=self.ckpt_path)
 
-        if not self.mode == 'valid':
-            return
-
-        optimizer = tf.train.AdamOptimizer(self.lr)
-
-        tvars = tf.trainable_variables()
-        gvs = optimizer.compute_gradients(self.cost, tvars)
-        self.train_op = optimizer.apply_gradients(gvs, global_step=self.global_step)
-
-    def fit(self, data):
-        self.error_during_train = False
-
-        print('fitting model...')
+        print("Starting training...")
+        print("%d steps per epoch." % (len(self.train_set) // self.batch_size_train))
         for epoch in range(self.epochs):
-            epoch_cost = []
-            state = [np.zeros([self.batch_size, self.latent_size], dtype=np.float32) for _ in range(self.layers)]
-            idx_arr = np.arange(len(data))
-            iters = np.arange(self.batch_size)
-            maxiter = iters.max()
-            start = idx_arr[iters]
-            finished = False
-            while not finished:
-                for i in np.arange(len(data.axes[1])-1):
-                    in_idx = data.iloc[start,i]
-                    out_idx = data.iloc[start,i+1]
-                    # prepare inputs, targeted outputs and hidden states
-                    fetches = [self.cost, self.final_state, self.global_step, self.lr, self.train_op]
-                    feed_dict = {self.X: in_idx, self.Y: out_idx}
-                    for j in range(self.layers):
-                        feed_dict[self.state[j]] = state[j]
+            loss_in_epoch = []
+            rec10_in_epoch = []
+            step = None
+            for input_batch, input_length in self.minibatches(
+                    inputs=self.train_set, input_length=self.train_length, batch_size=self.batch_size_train):
+                # pad inputs
+                x_batch, y_batch, batch_length = self.padding_sequence(input_batch)
+                y_n_batch = np.random.choice(self.whole_items, batch_length).reshape(1, batch_length)
+                feed_dict = {
+                    self.item_input: x_batch,
+                    self.item_output: y_batch,
+                    self.item_neg_output: y_n_batch
+                }
+                _, loss, step, rec10 = self.sess.run(
+                    [self.train_op, self.loss, self.global_step, self.rec10], feed_dict=feed_dict)
 
-                    cost, state, step, lr, _ = self.sess.run(fetches, feed_dict)
-                    epoch_cost.append(cost)
-                    if np.isnan(cost):
-                        print(str(epoch) + ':Nan error!')
-                        self.error_during_train = True
-                        return
+                recall_rate = np.mean(np.divide(rec10, input_length))
+                loss_in_epoch.append(loss)
+                rec10_in_epoch.append(recall_rate)
 
-                    avgc = np.mean(epoch_cost)
-                    print('Epoch {}\tStep {}\tlr: {:.6f}\tloss: {:.6f}'.format(epoch, step, lr, avgc))
+                print("Epoch %d, Step: %d, Loss: %.4f, Recall@10: %.4f" % (epoch, step, loss, recall_rate))
 
-                start = start + len(iters)
-                end = end + len(iters)
+            print("Epoch %d, Step: %d, Loss: %.4f, Recall@10: %.4f" %
+                  (epoch, step, np.mean(loss_in_epoch), np.mean(rec10_in_epoch)))
 
-                if end[-1] >= idx_arr[-1]:
-                    finished = True
+            if (epoch + 1) % self.save_per_epoch == 0:
+                self.saver.save(self.sess, "models/bi-lstm-imdb.ckpt")
 
-            avgc = np.mean(epoch_cost)
-            if np.isnan(avgc):
-                print('Epoch {}: Nan error!'.format(epoch, avgc))
-                self.error_during_train = True
-                return
-            self.saver.save(self.sess, '{}/gru-model'.format('.'), global_step=epoch)
+    def predict(self, restore=False):
+        if restore:
+            self.build()
+            self.sess.run(tf.global_variables_initializer())
+            self.saver.restore(sess=self.sess, save_path=self.ckpt_path)
+
+        print("Starting testing...")
+        print("%d steps per epoch." % (len(self.test_set) // self.batch_size_test))
+        loss_list = []
+        rec10_list = []
+        for input_batch, input_length in self.minibatches(
+                inputs=self.test_set, input_length=self.test_length, batch_size=self.batch_size_test):
+            # pad inputs
+            x_batch, y_batch, batch_length = self.padding_sequence(input_batch)
+            y_n_batch = np.random.choice(self.whole_items, batch_length).reshape(1, batch_length)
+            feed_dict = {
+                self.item_input: x_batch,
+                self.item_output: y_batch,
+                self.item_neg_output: y_n_batch
+            }
+            loss, rec10 = self.sess.run(
+                [self.loss, self.rec10], feed_dict=feed_dict)
+
+            recall_rate = np.mean(np.divide(rec10, input_length))
+            loss_list.append(loss)
+            rec10_list.append(recall_rate)
+            print("Test finished on training set! Loss: %.4f, Acc: %.4f" % (np.mean(loss_list), np.mean(rec10_list)))
+
+    def minibatches(self, inputs, input_length, batch_size, shuffle=False):
+        if shuffle:
+            indices = np.arange(len(inputs))
+            np.random.shuffle(indices)
+        for start_idx in range(0, len(inputs) - batch_size + 1, batch_size):
+            if shuffle:
+                excerpt = indices[start_idx:start_idx + batch_size]
+            else:
+                excerpt = slice(start_idx, start_idx + batch_size)
+            yield inputs[excerpt], input_length[excerpt]
+
+    def padding_sequence(self, inputs):
+        batch_size = len(inputs)
+        # assert self.batch_size == batch_size
+        maxlen = np.max([len(i) for i in inputs])
+        x = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
+        y = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
+        for i, seq in enumerate(inputs):
+            x[i][:len(seq[:-1])] = np.array(seq[:-1])
+            y[i][:len(seq[1:])] = np.array(seq[1:])
+        batch_length = maxlen - 1
+        return x, y, batch_length
