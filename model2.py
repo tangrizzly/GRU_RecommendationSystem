@@ -7,13 +7,13 @@ Created on 26/12/2017 10:16 AM
 """
 import tensorflow as tf
 from utils import *
+import sys
 
 
 class taobao(object):
     def __init__(self, config, session, max_item_no, whole_items, train_set, test_set, train_length, test_length):
         self.sess = session
         self.config = config
-        # self.mode = config.mode
         self.at_nums = config.at_nums
         self.latent_size = config.latent_size
         self.embedding_size = self.latent_size
@@ -33,7 +33,6 @@ class taobao(object):
         self.save_per_epoch = config.save_per_epoch
 
     def build(self):
-        tf.set_random_seed(1)
         self.item_input = tf.placeholder(tf.int32, [None, None], name='input')
         self.item_output = tf.placeholder(tf.int32, [None, None], name='output')
         self.item_neg_output = tf.placeholder(tf.int32, [None, None], name='negtive_output')
@@ -54,9 +53,10 @@ class taobao(object):
 
         with tf.variable_scope('output'):
             cal_scores = tf.map_fn(lambda x: tf.matmul(x, self.embedding, transpose_b=True), self.output)
-            func = lambda x: tf.reduce_sum(
-                tf.cast(tf.nn.in_top_k(x, tf.reshape(self.item_output, [-1]), 10), tf.float32))
-            self.rec10 = tf.map_fn(func, cal_scores)
+            # func = lambda x: tf.reduce_sum(
+            #     tf.cast(tf.nn.in_top_k(x, tf.reshape(self.item_output, [-1]), 10), tf.float32))
+            # self.rec10 = tf.map_fn(func, cal_scores)
+            _, self.max_10 = tf.nn.top_k(cal_scores, k=10)
 
             self.item_output_embedded = tf.nn.embedding_lookup(self.embedding, self.item_output)
             self.y_p = tf.multiply(self.output, self.item_output_embedded)  # positive example
@@ -90,17 +90,19 @@ class taobao(object):
             for input_batch, input_length in self.minibatches(
                     inputs=self.train_set, input_length=self.train_length, batch_size=self.batch_size_train):
                 # pad inputs
-                x_batch, y_batch, batch_length = self.padding_sequence(input_batch)
-                y_n_batch = np.random.choice(self.whole_items, batch_length).reshape(1, batch_length)
+                x_batch, y_batch, y_n_batch = self.padding_sequence(input_batch)
                 feed_dict = {
                     self.item_input: x_batch,
                     self.item_output: y_batch,
                     self.item_neg_output: y_n_batch
                 }
-                _, loss, step, rec10 = self.sess.run(
-                    [self.train_op, self.loss, self.global_step, self.rec10], feed_dict=feed_dict)
+                _, loss, step, max_10 = self.sess.run(
+                    [self.train_op, self.loss, self.global_step, self.max_10], feed_dict=feed_dict)
 
-                recall_rate = np.mean(np.divide(rec10, input_length))
+                max10 = np.reshape(max_10, (-1, 10))
+                target = np.reshape(y_batch, (-1))
+                recall_rate = np.sum(np.isin(target, max10))/np.sum(input_length)
+
                 loss_in_epoch.append(loss)
                 rec10_in_epoch.append(recall_rate)
 
@@ -125,17 +127,20 @@ class taobao(object):
         for input_batch, input_length in self.minibatches(
                 inputs=self.test_set, input_length=self.test_length, batch_size=self.batch_size_test):
             # pad inputs
-            x_batch, y_batch, batch_length = self.padding_sequence(input_batch)
+            x_batch, y_batch, y_n_batch = self.padding_sequence(input_batch)
             y_n_batch = np.random.choice(self.whole_items, batch_length).reshape(1, batch_length)
             feed_dict = {
                 self.item_input: x_batch,
                 self.item_output: y_batch,
                 self.item_neg_output: y_n_batch
             }
-            loss, rec10 = self.sess.run(
-                [self.loss, self.rec10], feed_dict=feed_dict)
+            loss, max_10 = self.sess.run(
+                [self.loss, self.max_10], feed_dict=feed_dict)
 
-            recall_rate = np.mean(np.divide(rec10, input_length))
+            max10 = np.reshape(max_10, (-1, 10))
+            target = np.reshape(y_batch, (-1))
+            recall_rate = np.sum(np.isin(target, max10)) / np.sum(input_length)
+
             loss_list.append(loss)
             rec10_list.append(recall_rate)
             print("Test finished on training set! Loss: %.4f, Acc: %.4f" % (np.mean(loss_list), np.mean(rec10_list)))
@@ -153,12 +158,13 @@ class taobao(object):
 
     def padding_sequence(self, inputs):
         batch_size = len(inputs)
-        # assert self.batch_size == batch_size
         maxlen = np.max([len(i) for i in inputs])
+        # length = np.sum([len(i) for i in inputs])
         x = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
         y = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
+        y_n = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
         for i, seq in enumerate(inputs):
             x[i][:len(seq[:-1])] = np.array(seq[:-1])
             y[i][:len(seq[1:])] = np.array(seq[1:])
-        batch_length = maxlen - 1
-        return x, y, batch_length
+            y_n[i] = np.random.choice(self.whole_items, maxlen - 1)
+        return x, y, y_n  # , length
