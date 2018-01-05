@@ -7,7 +7,6 @@ Created on 26/12/2017 10:16 AM
 """
 import tensorflow as tf
 from utils import *
-import sys
 
 
 class taobao(object):
@@ -36,36 +35,37 @@ class taobao(object):
         self.item_input = tf.placeholder(tf.int32, [None, None], name='input')
         self.item_output = tf.placeholder(tf.int32, [None, None], name='output')
         self.item_neg_output = tf.placeholder(tf.int32, [None, None], name='negtive_output')
-        sigma = np.sqrt(6.0 / (self.items_size + self.latent_size))
-        initializer = tf.random_uniform_initializer(minval=-sigma, maxval=sigma)
+        self.item_output_mask = tf.placeholder(tf.float32, [None, None], name='output_mask')
+        initializer = tf.random_uniform_initializer(minval=-0.5, maxval=0.5)
         self.embedding = tf.get_variable('embedding', [self.items_size, self.latent_size], initializer=initializer)
         self.item_input_embedded = tf.nn.embedding_lookup(self.embedding, self.item_input)
         self.global_step = tf.Variable(0, name='global_step', trainable=False)
         self.loss = None
-        self.rec10 = None
         self.max_10 = None
+        self.output = None
 
         with tf.variable_scope('gru_layer'):
-            cell = tf.contrib.rnn.GRUCell(self.latent_size, activation=tf.tanh)
+            cell = tf.contrib.rnn.GRUCell(self.latent_size, activation=tf.sigmoid)
             self.cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=self.keep_prob)
             self.output, self.state = tf.nn.dynamic_rnn(cell=self.cell, inputs=self.item_input_embedded,
                                                         dtype=tf.float32)
 
         with tf.variable_scope('output'):
-            cal_scores = tf.map_fn(lambda x: tf.matmul(x, self.embedding, transpose_b=True), self.output)
-            # func = lambda x: tf.reduce_sum(
-            #     tf.cast(tf.nn.in_top_k(x, tf.reshape(self.item_output, [-1]), 10), tf.float32))
-            # self.rec10 = tf.map_fn(func, cal_scores)
+            # cal_scores = tf.map_fn(lambda x: tf.matmul(x, self.embedding, transpose_b=True), self.output)
+            # _, self.max_10 = tf.nn.top_k(cal_scores, k=10)
+
+            cal_scores = tf.matmul(self.output[:, -1, :], self.embedding[1:], transpose_b=True)
             _, self.max_10 = tf.nn.top_k(cal_scores, k=10)
 
             self.item_output_embedded = tf.nn.embedding_lookup(self.embedding, self.item_output)
-            self.y_p = tf.multiply(self.output, self.item_output_embedded)  # positive example
             self.item_neg_output_embedded = tf.nn.embedding_lookup(self.embedding, self.item_neg_output)
-            self.y_n = tf.multiply(self.output, self.item_neg_output_embedded)  # positive example  # negative example
+            self.prefr = tf.multiply(self.output, self.item_output_embedded - self.item_neg_output_embedded)
+            mask = tf.expand_dims(self.item_output_mask, 2)
+            self.prefr_masked = tf.reduce_sum(tf.multiply(self.prefr, mask), 2)
             tvars = tf.trainable_variables()
             lossL2 = tf.add_n([tf.nn.l2_loss(v) for v in tvars
                                if 'bias' not in v.name]) * self.lmd
-            loss = tf.reduce_sum(-tf.log(tf.sigmoid(self.y_p - self.y_n)))
+            loss = tf.reduce_sum(-tf.log(tf.sigmoid(self.prefr_masked)))
             self.loss = loss + lossL2
 
         self.train_op = tf.train.AdamOptimizer(learning_rate=self.alpha).minimize(self.loss,
@@ -83,67 +83,57 @@ class taobao(object):
 
         print("Starting training...")
         print("%d steps per epoch." % (len(self.train_set) // self.batch_size_train))
+        loss_for_epoch = []
+        rec10_for_epoch = []
         for epoch in range(self.epochs):
-            loss_in_epoch = []
-            rec10_in_epoch = []
-            step = None
             for input_batch, input_length in self.minibatches(
                     inputs=self.train_set, input_length=self.train_length, batch_size=self.batch_size_train):
                 # pad inputs
-                x_batch, y_batch, y_n_batch = self.padding_sequence(input_batch)
+                x_batch, y_batch, y_n_batch, y_batch_mask = self.padding_sequence(input_batch)
                 feed_dict = {
                     self.item_input: x_batch,
                     self.item_output: y_batch,
-                    self.item_neg_output: y_n_batch
+                    self.item_neg_output: y_n_batch,
+                    self.item_output_mask: y_batch_mask
                 }
-                _, loss, step, max_10 = self.sess.run(
-                    [self.train_op, self.loss, self.global_step, self.max_10], feed_dict=feed_dict)
 
-                max10 = np.reshape(max_10, (-1, 10))
-                target = np.reshape(y_batch, (-1))
-                recall_rate = np.sum(np.isin(target, max10))/np.sum(input_length)
+                _, step, loss = self.sess.run(
+                    [self.train_op, self.global_step, self.loss], feed_dict=feed_dict)
+                print("Epoch %d, Step: %d, Loss: %.4f" % (epoch, step, loss))
 
-                loss_in_epoch.append(loss)
-                rec10_in_epoch.append(recall_rate)
+            hit = 0
+            length = 0
+            for input_batch, input_length, test_list, test_list_length in self.minibatches_test(
+                    inputs=self.train_set, input_length=self.train_length,
+                    outputs=self.test_set, outputs_length=self.test_length,
+                    batch_size=self.batch_size_test):
+                x_batch, y_batch, y_n_batch, y_batch_mask = self.padding_sequence(input_batch)
+                feed_dict = {
+                    self.item_input: x_batch,
+                    self.item_output: y_batch,
+                    self.item_neg_output: y_n_batch,
+                    self.item_output_mask: y_batch_mask
+                }
+                loss, max_10 = self.sess.run(
+                    [self.loss, self.max_10], feed_dict=feed_dict)
+                for i in range(len(test_list)):
+                    isin = np.apply_along_axis(lambda x: np.isin(x, max_10[i]), 0, test_list[i])
+                    hit = hit + np.sum(isin)
+                    length = length + test_list_length[i]
 
-                print("Epoch %d, Step: %d, Loss: %.4f, Recall@10: %.4f" % (epoch, step, loss, recall_rate))
+            rec10_for_epoch.append(hit/length)
+            loss_for_epoch.append(loss)
 
-            print("Epoch %d, Step: %d, Loss: %.4f, Recall@10: %.4f" %
-                  (epoch, step, np.mean(loss_in_epoch), np.mean(rec10_in_epoch)))
+            # bestrec = np.argmax(rec10_in_epoch)
+            # print("Epoch %d, Loss: %.4f, Recall@10: (%d, %.4f)" %
+            #       (epoch, np.sum(loss_in_epoch), bestrec, rec10_in_epoch[bestrec]))
+
+            print("Epoch %d, Loss: %.4f, Recall@10:" %(epoch, np.sum(loss_for_epoch)))
+            print(rec10_for_epoch)
+
 
             if (epoch + 1) % self.save_per_epoch == 0:
                 self.saver.save(self.sess, "models/bi-lstm-imdb.ckpt")
-
-    def predict(self, restore=False):
-        if restore:
-            self.build()
-            self.sess.run(tf.global_variables_initializer())
-            self.saver.restore(sess=self.sess, save_path=self.ckpt_path)
-
-        print("Starting testing...")
-        print("%d steps per epoch." % (len(self.test_set) // self.batch_size_test))
-        loss_list = []
-        rec10_list = []
-        for input_batch, input_length in self.minibatches(
-                inputs=self.test_set, input_length=self.test_length, batch_size=self.batch_size_test):
-            # pad inputs
-            x_batch, y_batch, y_n_batch = self.padding_sequence(input_batch)
-            y_n_batch = np.random.choice(self.whole_items, batch_length).reshape(1, batch_length)
-            feed_dict = {
-                self.item_input: x_batch,
-                self.item_output: y_batch,
-                self.item_neg_output: y_n_batch
-            }
-            loss, max_10 = self.sess.run(
-                [self.loss, self.max_10], feed_dict=feed_dict)
-
-            max10 = np.reshape(max_10, (-1, 10))
-            target = np.reshape(y_batch, (-1))
-            recall_rate = np.sum(np.isin(target, max10)) / np.sum(input_length)
-
-            loss_list.append(loss)
-            rec10_list.append(recall_rate)
-            print("Test finished on training set! Loss: %.4f, Acc: %.4f" % (np.mean(loss_list), np.mean(rec10_list)))
 
     def minibatches(self, inputs, input_length, batch_size, shuffle=False):
         if shuffle:
@@ -152,19 +142,27 @@ class taobao(object):
         for start_idx in range(0, len(inputs) - batch_size + 1, batch_size):
             if shuffle:
                 excerpt = indices[start_idx:start_idx + batch_size]
+                yield [inputs[i] for i in excerpt], [input_length[i] for i in excerpt]
             else:
                 excerpt = slice(start_idx, start_idx + batch_size)
-            yield inputs[excerpt], input_length[excerpt]
+                yield inputs[excerpt], input_length[excerpt]
+
+    def minibatches_test(self, inputs, outputs, input_length, outputs_length, batch_size):
+        for start_idx in range(0, len(inputs) - batch_size + 1, batch_size):
+            excerpt = slice(start_idx, start_idx + batch_size)
+            yield inputs[excerpt], input_length[excerpt], outputs[excerpt], outputs_length[excerpt]
+
 
     def padding_sequence(self, inputs):
         batch_size = len(inputs)
         maxlen = np.max([len(i) for i in inputs])
-        # length = np.sum([len(i) for i in inputs])
         x = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
         y = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
         y_n = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
+        y_mask = np.zeros([batch_size, maxlen - 1], dtype=np.int32)
         for i, seq in enumerate(inputs):
             x[i][:len(seq[:-1])] = np.array(seq[:-1])
             y[i][:len(seq[1:])] = np.array(seq[1:])
             y_n[i] = np.random.choice(self.whole_items, maxlen - 1)
-        return x, y, y_n  # , length
+            y_mask[i][:len(seq[1:])] = 1
+        return x, y, y_n, y_mask

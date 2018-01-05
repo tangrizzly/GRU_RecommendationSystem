@@ -19,5 +19,4 @@ if __name__ == "__main__":
     sess = tf.Session()
     gru = taobao(config, sess, max_item_no, whole_items, train_set, test_set, train_length, test_length)
     gru.train()
-    gru.predict()
     sess.close()
