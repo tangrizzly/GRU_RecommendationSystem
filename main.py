@@ -12,11 +12,11 @@ import os
 
 
 if __name__ == "__main__":
-    config = Config(1)
+    config = Config()
     if not os.path.exists("models"):
         os.mkdir("models")
-    train_set, test_set, train_length, test_length, max_item_no, whole_items = load_taobao_data(config)
+    train_set, test_set, train_length, test_length, item_num = load_taobao_data(config)
     sess = tf.Session()
-    gru = taobao(config, sess, max_item_no, whole_items, train_set, test_set, train_length, test_length)
+    gru = taobao(config, sess, item_num, train_set, test_set, train_length, test_length)
     gru.train()
     sess.close()
